@@ -1,0 +1,39 @@
+{
+  "hand_detection": {
+    "max_num_hands": 2,
+    "model_complexity": 1,
+    "min_detection_confidence": 0.5,
+    "min_tracking_confidence": 0.5
+  },
+  "camera": {
+    "camera_index": 0,
+    "target_width": 1280,
+    "target_height": 720,
+    "target_fps": 30
+  },
+  "display": {
+    "window_name": "Knife Skills Trainer",
+    "show_fps": true,
+    "show_stats": true,
+    "show_hand_connections": true,
+    "show_hand_landmarks": true,
+    "show_landmark_labels": false
+  },
+  "coordinates": {
+    "default_pixels_per_mm": 3.0,
+    "cutting_board_width_mm": 300.0,
+    "cutting_board_height_mm": 200.0
+  },
+  "safety": {
+    "green_zone_mm": 50.0,
+    "yellow_zone_mm": 30.0,
+    "red_zone_mm": 15.0,
+    "critical_zone_mm": 5.0,
+    "enable_audio_warnings": true,
+    "prediction_time_ms": 300
+  },
+  "target_fps": 20,
+  "enable_performance_monitoring": true,
+  "debug_mode": false,
+  "save_debug_frames": false
+}
