@@ -6,7 +6,14 @@ Provides professional visualization of hand tracking data.
 from typing import List, Tuple
 import cv2
 import numpy as np
-from ..detection.hand_detector import HandLandmarks
+
+try:
+    from ..detection.hand_detector import HandLandmarks
+    from ..detection.knife_detector import KnifeBoundary
+except ImportError:
+    # Handle imports when running from project root
+    from detection.hand_detector import HandLandmarks
+    from detection.knife_detector import KnifeBoundary
 
 
 class OverlayRenderer:
@@ -22,6 +29,13 @@ class OverlayRenderer:
     LANDMARK_RADIUS = 3  # Smaller for better performance
     CONNECTION_THICKNESS = 1  # Thinner lines for better performance
     LANDMARK_THICKNESS = -1  # Filled circle
+    
+    # Knife visualization colors
+    KNIFE_BBOX_COLOR = (0, 255, 255)    # Cyan for bounding box
+    KNIFE_CONTOUR_COLOR = (0, 165, 255)  # Orange for blade contour
+    KNIFE_TIP_COLOR = (0, 0, 255)       # Red for knife tip
+    KNIFE_HANDLE_COLOR = (255, 0, 0)    # Blue for handle
+    KNIFE_MASK_ALPHA = 0.3               # Transparency for mask overlay
     
     # Landmark indices for finger tips (for highlighting)
     FINGERTIP_LANDMARKS = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
@@ -183,6 +197,112 @@ class OverlayRenderer:
         """
         # Placeholder for Day 4 implementation
         return frame
+    
+    def render_knives(self, frame: np.ndarray, detected_knives: List[KnifeBoundary]) -> np.ndarray:
+        """
+        Render knife overlays on the frame.
+        
+        Args:
+            frame: Input frame to draw on
+            detected_knives: List of detected knives with boundaries
+            
+        Returns:
+            Frame with knife overlays drawn
+        """
+        if not detected_knives:
+            return frame
+            
+        overlay_frame = frame.copy()
+        
+        for knife in detected_knives:
+            # Draw bounding box
+            x1, y1, x2, y2 = knife.bbox
+            cv2.rectangle(overlay_frame, (x1, y1), (x2, y2), self.KNIFE_BBOX_COLOR, 2)
+            
+            # Draw segmentation mask with transparency
+            if knife.mask is not None:
+                mask_colored = np.zeros_like(overlay_frame)
+                mask_colored[knife.mask > 0] = self.KNIFE_CONTOUR_COLOR
+                overlay_frame = cv2.addWeighted(overlay_frame, 1.0, mask_colored, self.KNIFE_MASK_ALPHA, 0)
+            
+            # Draw contour outline
+            if knife.contour is not None:
+                cv2.drawContours(overlay_frame, [knife.contour], -1, self.KNIFE_CONTOUR_COLOR, 2)
+            
+            # Draw tip and handle points
+            cv2.circle(overlay_frame, knife.tip_point, 6, self.KNIFE_TIP_COLOR, -1)
+            cv2.circle(overlay_frame, knife.handle_point, 6, self.KNIFE_HANDLE_COLOR, -1)
+            
+            # Draw tip and handle labels
+            cv2.putText(overlay_frame, "TIP", 
+                       (knife.tip_point[0] + 10, knife.tip_point[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.KNIFE_TIP_COLOR, 2)
+            cv2.putText(overlay_frame, "HANDLE", 
+                       (knife.handle_point[0] + 10, knife.handle_point[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.KNIFE_HANDLE_COLOR, 2)
+            
+            # Draw confidence and blade length info
+            info_text = f"Knife: {knife.confidence:.2f} | {knife.blade_length_pixels:.0f}px"
+            text_pos = (x1, y1 - 10)
+            
+            # Draw text background
+            text_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(overlay_frame, 
+                         (text_pos[0] - 5, text_pos[1] - text_size[1] - 5),
+                         (text_pos[0] + text_size[0] + 5, text_pos[1] + 5),
+                         (0, 0, 0), -1)
+            
+            # Draw text
+            cv2.putText(overlay_frame, info_text, text_pos,
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.KNIFE_BBOX_COLOR, 2)
+        
+        return overlay_frame
+    
+    def render_safety_distances(self, frame: np.ndarray, hands: List[HandLandmarks], 
+                               knives: List[KnifeBoundary]) -> np.ndarray:
+        """
+        Render safety distance lines between hands and knives.
+        
+        Args:
+            frame: Input frame to draw on
+            hands: List of detected hands
+            knives: List of detected knives
+            
+        Returns:
+            Frame with safety distance visualization
+        """
+        if not hands or not knives:
+            return frame
+            
+        overlay_frame = frame.copy()
+        height, width = frame.shape[:2]
+        
+        for hand in hands:
+            # Get fingertip positions (index finger tip - landmark 8)
+            if len(hand.landmarks) > 8:
+                finger_tip = hand.landmarks[8]  # Index finger tip
+                tip_x = int(finger_tip[0] * width)
+                tip_y = int(finger_tip[1] * height)
+                
+                for knife in knives:
+                    # Calculate distance to knife tip
+                    dx = tip_x - knife.tip_point[0]
+                    dy = tip_y - knife.tip_point[1]
+                    tip_distance = np.sqrt(dx*dx + dy*dy)
+                    
+                    # Draw line from finger to knife tip
+                    cv2.line(overlay_frame, (tip_x, tip_y), knife.tip_point,
+                            (255, 255, 0), 2)  # Yellow line
+                    
+                    # Draw distance text at midpoint
+                    mid_x = (tip_x + knife.tip_point[0]) // 2
+                    mid_y = (tip_y + knife.tip_point[1]) // 2
+                    
+                    distance_text = f"{tip_distance:.0f}px"
+                    cv2.putText(overlay_frame, distance_text, (mid_x, mid_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        
+        return overlay_frame
     
     def set_display_options(self, show_connections: bool = None, 
                            show_landmarks: bool = None, show_labels: bool = None):
