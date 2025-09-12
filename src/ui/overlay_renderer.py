@@ -6,7 +6,14 @@ Provides professional visualization of hand tracking data.
 from typing import List, Tuple
 import cv2
 import numpy as np
-from ..detection.hand_detector import HandLandmarks
+
+try:
+    from ..detection.hand_detector import HandLandmarks
+    from ..detection.knife_detector import KnifeBoundary
+except ImportError:
+    # Handle imports when running from project root
+    from detection.hand_detector import HandLandmarks
+    from detection.knife_detector import KnifeBoundary
 
 
 class OverlayRenderer:
@@ -22,6 +29,13 @@ class OverlayRenderer:
     LANDMARK_RADIUS = 3  # Smaller for better performance
     CONNECTION_THICKNESS = 1  # Thinner lines for better performance
     LANDMARK_THICKNESS = -1  # Filled circle
+    
+    # Knife visualization colors
+    KNIFE_BBOX_COLOR = (0, 255, 255)    # Cyan for bounding box
+    KNIFE_CONTOUR_COLOR = (0, 165, 255)  # Orange for blade contour
+    KNIFE_TIP_COLOR = (0, 0, 255)       # Red for knife tip
+    KNIFE_HANDLE_COLOR = (255, 0, 0)    # Blue for handle
+    KNIFE_MASK_ALPHA = 0.3               # Transparency for mask overlay
     
     # Landmark indices for finger tips (for highlighting)
     FINGERTIP_LANDMARKS = [4, 8, 12, 16, 20]  # Thumb, Index, Middle, Ring, Pinky
@@ -183,6 +197,178 @@ class OverlayRenderer:
         """
         # Placeholder for Day 4 implementation
         return frame
+    
+    def render_knives(self, frame: np.ndarray, detected_knives: List[KnifeBoundary]) -> np.ndarray:
+        """
+        Render knife overlays on the frame.
+        
+        Args:
+            frame: Input frame to draw on
+            detected_knives: List of detected knives with boundaries
+            
+        Returns:
+            Frame with knife overlays drawn
+        """
+        if not detected_knives:
+            return frame
+            
+        overlay_frame = frame.copy()
+        
+        for knife in detected_knives:
+            # Draw bounding box
+            x1, y1, x2, y2 = knife.bbox
+            cv2.rectangle(overlay_frame, (x1, y1), (x2, y2), self.KNIFE_BBOX_COLOR, 2)
+            
+            # Draw segmentation mask with transparency
+            if knife.mask is not None:
+                mask_colored = np.zeros_like(overlay_frame)
+                mask_colored[knife.mask > 0] = self.KNIFE_CONTOUR_COLOR
+                overlay_frame = cv2.addWeighted(overlay_frame, 1.0, mask_colored, self.KNIFE_MASK_ALPHA, 0)
+            
+            # Draw contour outline
+            if knife.contour is not None:
+                cv2.drawContours(overlay_frame, [knife.contour], -1, self.KNIFE_CONTOUR_COLOR, 2)
+            
+            # Draw tip and handle points
+            cv2.circle(overlay_frame, knife.tip_point, 6, self.KNIFE_TIP_COLOR, -1)
+            cv2.circle(overlay_frame, knife.handle_point, 6, self.KNIFE_HANDLE_COLOR, -1)
+            
+            # Draw tip and handle labels
+            cv2.putText(overlay_frame, "TIP", 
+                       (knife.tip_point[0] + 10, knife.tip_point[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.KNIFE_TIP_COLOR, 2)
+            cv2.putText(overlay_frame, "HANDLE", 
+                       (knife.handle_point[0] + 10, knife.handle_point[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.KNIFE_HANDLE_COLOR, 2)
+            
+            # Draw confidence and blade length info
+            info_text = f"Knife: {knife.confidence:.2f} | {knife.blade_length_pixels:.0f}px"
+            text_pos = (x1, y1 - 10)
+            
+            # Draw text background
+            text_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(overlay_frame, 
+                         (text_pos[0] - 5, text_pos[1] - text_size[1] - 5),
+                         (text_pos[0] + text_size[0] + 5, text_pos[1] + 5),
+                         (0, 0, 0), -1)
+            
+            # Draw text
+            cv2.putText(overlay_frame, info_text, text_pos,
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.KNIFE_BBOX_COLOR, 2)
+        
+        return overlay_frame
+    
+    def render_safety_dangers(self, frame: np.ndarray, danger_events: List) -> np.ndarray:
+        """
+        Render safety danger indicators for dangerous fingertip proximities.
+        
+        Args:
+            frame: Input frame to draw on
+            danger_events: List of DangerEvent objects from SafetyMonitor
+            
+        Returns:
+            Frame with danger indicators drawn
+        """
+        if not danger_events:
+            return frame
+            
+        overlay_frame = frame.copy()
+        height, width = frame.shape[:2]
+        
+        # Group dangers by hand and fingertip for efficient rendering
+        danger_fingertips = {}
+        warning_messages = set()
+        
+        for danger in danger_events:
+            hand_id = id(danger.hand)  # Use object id as unique hand identifier
+            if hand_id not in danger_fingertips:
+                danger_fingertips[hand_id] = {
+                    'hand': danger.hand,
+                    'dangerous_tips': {}
+                }
+            
+            # Store the most severe danger for each fingertip
+            if (danger.fingertip_idx not in danger_fingertips[hand_id]['dangerous_tips'] or
+                self._is_more_severe(danger.severity, 
+                                   danger_fingertips[hand_id]['dangerous_tips'][danger.fingertip_idx]['severity'])):
+                danger_fingertips[hand_id]['dangerous_tips'][danger.fingertip_idx] = {
+                    'severity': danger.severity,
+                    'distance': danger.distance
+                }
+            
+            # Collect warning messages
+            warning_messages.add(f"{danger.severity.upper()}: Finger near blade!")
+        
+        # Render danger indicators for each dangerous fingertip
+        for hand_data in danger_fingertips.values():
+            hand = hand_data['hand']
+            dangerous_tips = hand_data['dangerous_tips']
+            
+            # Convert normalized coordinates to pixel coordinates  
+            pixel_landmarks = self._normalize_to_pixel(hand.landmarks, width, height)
+            
+            for fingertip_idx, danger_info in dangerous_tips.items():
+                if fingertip_idx < len(pixel_landmarks):
+                    x, y = pixel_landmarks[fingertip_idx]
+                    
+                    # Get danger color based on severity
+                    danger_color = self._get_danger_color(danger_info['severity'])
+                    
+                    # Draw enlarged danger circle
+                    danger_radius = self.LANDMARK_RADIUS + 4  # Larger than normal landmarks
+                    cv2.circle(overlay_frame, (x, y), danger_radius, danger_color, -1)
+                    
+                    # Draw white border for visibility
+                    cv2.circle(overlay_frame, (x, y), danger_radius + 2, (255, 255, 255), 2)
+                    
+                    # Add pulsing effect for critical dangers
+                    if danger_info['severity'] == 'critical':
+                        pulse_radius = danger_radius + 6
+                        cv2.circle(overlay_frame, (x, y), pulse_radius, danger_color, 2)
+        
+        # Draw warning messages
+        self._draw_danger_warnings(overlay_frame, warning_messages)
+        
+        return overlay_frame
+    
+    def _is_more_severe(self, severity1: str, severity2: str) -> bool:
+        """Check if severity1 is more severe than severity2"""
+        severity_order = {'critical': 3, 'high': 2, 'medium': 1}
+        return severity_order.get(severity1, 0) > severity_order.get(severity2, 0)
+    
+    def _get_danger_color(self, severity: str) -> Tuple[int, int, int]:
+        """Get BGR color for danger severity level"""
+        colors = {
+            "critical": (0, 0, 255),      # Bright red
+            "high": (0, 69, 255),         # Red-orange  
+            "medium": (0, 165, 255),      # Orange
+        }
+        return colors.get(severity, (255, 255, 255))  # White fallback
+    
+    def _draw_danger_warnings(self, frame: np.ndarray, warnings: set):
+        """Draw danger warning messages on the frame"""
+        if not warnings:
+            return
+            
+        # Position warnings at top-center of frame
+        y_start = 60
+        line_height = 30
+        
+        for i, warning in enumerate(sorted(warnings)):
+            # Draw text background
+            text_size = cv2.getTextSize(warning, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+            text_x = (frame.shape[1] - text_size[0]) // 2
+            text_y = y_start + i * line_height
+            
+            # Background rectangle
+            cv2.rectangle(frame, 
+                         (text_x - 10, text_y - text_size[1] - 5),
+                         (text_x + text_size[0] + 10, text_y + 5),
+                         (0, 0, 0), -1)
+            
+            # Warning text in bright red
+            cv2.putText(frame, warning, (text_x, text_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     
     def set_display_options(self, show_connections: bool = None, 
                            show_landmarks: bool = None, show_labels: bool = None):
