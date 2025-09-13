@@ -45,13 +45,26 @@ class DepthEstimator:
     """
     Monocular depth estimation using Depth Anything V2.
     Supports both Hugging Face pipeline and local PyTorch models.
+
+    IMPORTANT Z-ACCURACY LIMITATION:
+    This estimator outputs RELATIVE depth scaled by max_depth, NOT physically calibrated metric depth.
+    Z values will vary with scene composition due to per-frame normalization.
+    For metric accuracy, use single-point calibration or disable per-frame normalization.
+
+    Performance:
+    - Core ML (Apple Neural Engine): ~43ms (23+ FPS) - RECOMMENDED
+    - Direct PyTorch (MPS): ~95ms (10+ FPS)
+    - HuggingFace Pipeline: ~340ms (3 FPS) - DEPRECATED
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model_type: str = "pytorch",
                  model_size: str = "small",
                  max_depth: float = 20.0,
-                 device: str = "auto"):
+                 device: str = "auto",
+                 enable_bleeding_correction: bool = False,
+                 calibration_factor: Optional[float] = None,
+                 disable_per_frame_normalization: bool = False):
         """
         Initialize depth estimator.
         
@@ -60,11 +73,23 @@ class DepthEstimator:
             model_size: "small", "base", "large", or "giant"
             max_depth: Maximum depth range in meters (20 for indoor, 80 for outdoor)
             device: "auto", "cpu", "cuda", or "mps"
+            enable_bleeding_correction: DEPRECATED - Depth bleeding correction disabled (targets wrong problem)
+            calibration_factor: Optional single-point calibration multiplier for metric accuracy
+            disable_per_frame_normalization: If True, avoid per-frame normalization for consistent Z values
+
+        Z-ACCURACY NOTES:
+        - Default output is RELATIVE depth scaled by max_depth, not metric depth
+        - Per-frame normalization causes Z values to vary with scene composition
+        - For metric accuracy: provide calibration_factor from known reference distance
+        - For consistent relative Z: set disable_per_frame_normalization=True
         """
         self.model_type = model_type
         self.model_size = model_size
         self.max_depth = max_depth
         self.device = self._get_device(device)
+        self.enable_bleeding_correction = enable_bleeding_correction
+        self.calibration_factor = calibration_factor
+        self.disable_per_frame_normalization = disable_per_frame_normalization
         
         # Performance tracking
         self._frame_count = 0
@@ -238,6 +263,9 @@ class DepthEstimator:
         inference_time = time.time() - start_time
         self._total_inference_time += inference_time
         
+        # Note: Depth bleeding correction disabled - targets wrong problem
+        # Real Z accuracy issues stem from relative depth scaling, not bleeding artifacts
+        
         return depth_map
     
     def _estimate_depth_hf(self, frame: np.ndarray) -> np.ndarray:
@@ -253,11 +281,10 @@ class DepthEstimator:
         # Convert PIL depth to numpy array
         depth_array = np.array(depth_pil, dtype=np.float32)
         
-        # Normalize to meters based on max_depth
+        # Apply depth scaling and calibration
         # Note: Hugging Face pipeline returns normalized depth [0,1]
-        # Scale to real-world depth range
-        depth_meters = depth_array * self.max_depth
-        
+        depth_meters = self._apply_depth_scaling(depth_array)
+
         return depth_meters
     
     def _estimate_depth_pytorch(self, frame: np.ndarray) -> np.ndarray:
@@ -276,11 +303,9 @@ class DepthEstimator:
         # Ensure float32 format
         depth_map = depth_map.astype(np.float32)
         
-        # Scale to real-world depth range
-        # Depth Anything V2 returns relative depth, scale to max_depth
-        depth_normalized = depth_map / depth_map.max() if depth_map.max() > 0 else depth_map
-        depth_meters = depth_normalized * self.max_depth
-        
+        # Apply depth scaling and calibration
+        depth_meters = self._apply_depth_scaling(depth_map)
+
         return depth_meters
     
     def _estimate_depth_coreml(self, frame: np.ndarray) -> np.ndarray:
@@ -322,9 +347,10 @@ class DepthEstimator:
             else:
                 depth_map = np.array(depth_output)
             
-            # Remove batch dimension if present
-            while len(depth_map.shape) > 2:
-                depth_map = depth_map.squeeze(0)
+            # Remove batch dimension if present - robust handling for all shapes
+            depth_map = np.squeeze(depth_output)
+            if depth_map.ndim == 3:
+                depth_map = depth_map[..., 0]
             
             # Resize back to original frame size if needed
             if depth_map.shape[:2] != (original_height, original_width):
@@ -333,16 +359,43 @@ class DepthEstimator:
             # Ensure float32 format
             depth_map = depth_map.astype(np.float32)
             
-            # Scale to real-world depth range
-            # Core ML model outputs relative depth, scale to max_depth
-            depth_normalized = depth_map / depth_map.max() if depth_map.max() > 0 else depth_map
-            depth_meters = depth_normalized * self.max_depth
-            
+            # Apply depth scaling and calibration
+            depth_meters = self._apply_depth_scaling(depth_map)
+
             return depth_meters
             
         except Exception as e:
             print(f"❌ Core ML inference failed: {e}")
             raise
+    
+    # NOTE: Depth bleeding correction methods removed
+    # Analysis showed that Depth Anything V2 produces smooth relative depth maps with very low gradients.
+    # The "bleeding correction" approach targeted traditional depth noise artifacts that don't exist in this model.
+    # Real Z accuracy issues stem from relative depth scaling (not physical calibration), not bleeding artifacts.
+
+    def _apply_depth_scaling(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        Apply depth scaling and calibration based on configuration.
+
+        Args:
+            depth_map: Raw relative depth map from model
+
+        Returns:
+            Scaled depth map in meters (relative or calibrated)
+        """
+        if self.disable_per_frame_normalization:
+            # Use depth values as-is, just scale by max_depth
+            depth_meters = depth_map * self.max_depth
+        else:
+            # Standard per-frame normalization (causes scene-dependent Z values)
+            depth_normalized = depth_map / depth_map.max() if depth_map.max() > 0 else depth_map
+            depth_meters = depth_normalized * self.max_depth
+
+        # Apply optional single-point calibration
+        if self.calibration_factor is not None:
+            depth_meters = depth_meters * self.calibration_factor
+
+        return depth_meters
     
     def get_3d_coordinates(self, point_2d: Tuple[int, int], 
                           depth_map: np.ndarray,
@@ -415,7 +468,11 @@ class DepthEstimator:
             "model_type": self.model_type,
             "model_size": self.model_size,
             "max_depth": self.max_depth,
-            "device": self.device
+            "device": self.device,
+            "bleeding_correction_disabled": "Depth bleeding correction removed - targets wrong problem",
+            "calibration_factor": self.calibration_factor,
+            "disable_per_frame_normalization": self.disable_per_frame_normalization,
+            "z_accuracy_warning": "Output is relative depth, not metric depth (see class docstring)"
         }
     
     def reset_stats(self):
