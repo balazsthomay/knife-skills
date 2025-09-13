@@ -8,6 +8,22 @@ import cv2
 import numpy as np
 from PIL import Image
 import time
+import sys
+import os
+from pathlib import Path
+
+# Add Depth Anything V2 to path
+DEPTH_ANYTHING_PATH = Path(__file__).parent.parent.parent / "Depth-Anything-V2"
+if DEPTH_ANYTHING_PATH.exists():
+    sys.path.insert(0, str(DEPTH_ANYTHING_PATH))
+
+try:
+    import torch
+    from depth_anything_v2.dpt import DepthAnythingV2
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️  Warning: torch or depth_anything_v2 not available.")
 
 try:
     from transformers import pipeline
@@ -24,7 +40,7 @@ class DepthEstimator:
     """
     
     def __init__(self, 
-                 model_type: str = "huggingface",
+                 model_type: str = "pytorch",
                  model_size: str = "small",
                  max_depth: float = 20.0,
                  device: str = "auto"):
@@ -32,7 +48,7 @@ class DepthEstimator:
         Initialize depth estimator.
         
         Args:
-            model_type: "huggingface" or "local" 
+            model_type: "pytorch" (direct) or "huggingface" (pipeline) 
             model_size: "small", "base", "large", or "giant"
             max_depth: Maximum depth range in meters (20 for indoor, 80 for outdoor)
             device: "auto", "cpu", "cuda", or "mps"
@@ -50,23 +66,24 @@ class DepthEstimator:
         self.model = None
         self.pipeline = None
         
-        if model_type == "huggingface":
+        if model_type == "pytorch":
+            self._load_pytorch_model()
+        elif model_type == "huggingface":
             self._load_huggingface_model()
         else:
-            self._load_local_model()
+            raise ValueError(f"Unknown model_type: {model_type}. Use 'pytorch' or 'huggingface'")
     
     def _get_device(self, device: str) -> str:
         """Determine the best available device"""
         if device == "auto":
-            try:
-                import torch
+            if TORCH_AVAILABLE:
                 if torch.cuda.is_available():
                     return "cuda"
                 elif torch.backends.mps.is_available():
                     return "mps"
                 else:
                     return "cpu"
-            except ImportError:
+            else:
                 return "cpu"
         return device
     
@@ -97,9 +114,48 @@ class DepthEstimator:
             print(f"❌ Failed to load Depth Anything V2: {e}")
             raise
     
-    def _load_local_model(self):
-        """Load local PyTorch model (placeholder for Phase 3)"""
-        raise NotImplementedError("Local PyTorch model loading not implemented yet. Use model_type='huggingface'")
+    def _load_pytorch_model(self):
+        """Load direct PyTorch Depth Anything V2 model"""
+        if not TORCH_AVAILABLE:
+            raise ImportError("torch and depth_anything_v2 required for PyTorch model. Ensure Depth-Anything-V2 is cloned.")
+        
+        # Model configurations from Depth Anything V2
+        model_configs = {
+            'small': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'base': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'large': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'giant': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
+        
+        if self.model_size not in model_configs:
+            raise ValueError(f"Unsupported model size: {self.model_size}. Choose from {list(model_configs.keys())}")
+        
+        config = model_configs[self.model_size]
+        encoder = config['encoder']
+        
+        print(f"🔄 Loading Depth Anything V2 ({self.model_size}) via direct PyTorch...")
+        print(f"📱 Device: {self.device}")
+        
+        try:
+            # Initialize model
+            self.model = DepthAnythingV2(**config)
+            
+            # Load pre-trained weights
+            checkpoint_path = DEPTH_ANYTHING_PATH / "checkpoints" / f"depth_anything_v2_{encoder}.pth"
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+            
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+            self.model.load_state_dict(state_dict)
+            
+            # Move to device and set eval mode
+            self.model = self.model.to(self.device).eval()
+            
+            print("✅ Depth Anything V2 model loaded successfully")
+            
+        except Exception as e:
+            print(f"❌ Failed to load Depth Anything V2: {e}")
+            raise
     
     def estimate_depth(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -114,10 +170,12 @@ class DepthEstimator:
         start_time = time.time()
         self._frame_count += 1
         
-        if self.model_type == "huggingface":
+        if self.model_type == "pytorch":
+            depth_map = self._estimate_depth_pytorch(frame)
+        elif self.model_type == "huggingface":
             depth_map = self._estimate_depth_hf(frame)
         else:
-            depth_map = self._estimate_depth_local(frame)
+            raise ValueError(f"Unknown model_type: {self.model_type}")
         
         # Update performance tracking
         inference_time = time.time() - start_time
@@ -145,10 +203,28 @@ class DepthEstimator:
         
         return depth_meters
     
-    def _estimate_depth_local(self, frame: np.ndarray) -> np.ndarray:
-        """Estimate depth using local PyTorch model"""
-
-        raise NotImplementedError("Local model inference not implemented yet")
+    def _estimate_depth_pytorch(self, frame: np.ndarray) -> np.ndarray:
+        """Estimate depth using direct PyTorch model"""
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Direct inference - no pipeline overhead
+        with torch.no_grad():
+            depth_map = self.model.infer_image(rgb_frame)
+        
+        # Convert to numpy if tensor
+        if torch.is_tensor(depth_map):
+            depth_map = depth_map.cpu().numpy()
+        
+        # Ensure float32 format
+        depth_map = depth_map.astype(np.float32)
+        
+        # Scale to real-world depth range
+        # Depth Anything V2 returns relative depth, scale to max_depth
+        depth_normalized = depth_map / depth_map.max() if depth_map.max() > 0 else depth_map
+        depth_meters = depth_normalized * self.max_depth
+        
+        return depth_meters
     
     def get_3d_coordinates(self, point_2d: Tuple[int, int], 
                           depth_map: np.ndarray,
