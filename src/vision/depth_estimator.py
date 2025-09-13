@@ -40,6 +40,7 @@ except ImportError:
     print("⚠️  Warning: coremltools not available. Install with: pip install coremltools")
 
 
+
 class DepthEstimator:
     """
     Monocular depth estimation using Depth Anything V2.
@@ -369,10 +370,10 @@ class DepthEstimator:
         
         # Use default camera intrinsics if not provided
         if camera_intrinsics is None:
-            # Rough estimates for typical webcam
+            # More realistic estimates for typical webcam (approximate 60-70 degree FOV)
             camera_intrinsics = {
-                'fx': width * 0.8,  # Focal length x
-                'fy': height * 0.8,  # Focal length y  
+                'fx': width * 1.1,  # Focal length x
+                'fy': height * 1.1,  # Focal length y  
                 'cx': width / 2,    # Principal point x
                 'cy': height / 2    # Principal point y
             }
