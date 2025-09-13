@@ -32,6 +32,13 @@ except ImportError:
     HF_AVAILABLE = False
     print("⚠️  Warning: transformers not available. Install with: pip install transformers")
 
+try:
+    import coremltools as ct
+    COREML_AVAILABLE = True
+except ImportError:
+    COREML_AVAILABLE = False
+    print("⚠️  Warning: coremltools not available. Install with: pip install coremltools")
+
 
 class DepthEstimator:
     """
@@ -48,7 +55,7 @@ class DepthEstimator:
         Initialize depth estimator.
         
         Args:
-            model_type: "pytorch" (direct) or "huggingface" (pipeline) 
+            model_type: "pytorch" (direct), "huggingface" (pipeline), or "coreml" (Apple Neural Engine)
             model_size: "small", "base", "large", or "giant"
             max_depth: Maximum depth range in meters (20 for indoor, 80 for outdoor)
             device: "auto", "cpu", "cuda", or "mps"
@@ -70,8 +77,10 @@ class DepthEstimator:
             self._load_pytorch_model()
         elif model_type == "huggingface":
             self._load_huggingface_model()
+        elif model_type == "coreml":
+            self._load_coreml_model()
         else:
-            raise ValueError(f"Unknown model_type: {model_type}. Use 'pytorch' or 'huggingface'")
+            raise ValueError(f"Unknown model_type: {model_type}. Use 'pytorch', 'huggingface', or 'coreml'")
     
     def _get_device(self, device: str) -> str:
         """Determine the best available device"""
@@ -157,6 +166,51 @@ class DepthEstimator:
             print(f"❌ Failed to load Depth Anything V2: {e}")
             raise
     
+    def _load_coreml_model(self):
+        """Load Core ML Depth Anything V2 model for Apple Neural Engine"""
+        if not COREML_AVAILABLE:
+            raise ImportError("coremltools required for Core ML model. Install with: pip install coremltools")
+        
+        # Core ML model path
+        model_path = Path(__file__).parent.parent.parent / "models" / "DepthAnythingV2SmallF16.mlpackage"
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Core ML model not found: {model_path}")
+        
+        print(f"🔄 Loading Core ML Depth Anything V2 ({self.model_size})...")
+        print(f"📱 Device: Apple Neural Engine")
+        
+        try:
+            # Load Core ML model
+            self.model = ct.models.MLModel(str(model_path))
+            print("✅ Core ML Depth Anything V2 model loaded successfully")
+            
+            # Get model input/output info
+            spec = self.model.get_spec()
+            print(f"📊 Model inputs: {[input.name for input in spec.description.input]}")
+            print(f"📊 Model outputs: {[output.name for output in spec.description.output]}")
+            
+            # Get input image size constraints
+            for input_desc in spec.description.input:
+                if input_desc.name == "image":
+                    if hasattr(input_desc.type, 'imageType'):
+                        image_type = input_desc.type.imageType
+                        print(f"📊 Image input constraints: {image_type}")
+                        # Store expected input size for later use
+                        self._coreml_input_width = image_type.width
+                        self._coreml_input_height = image_type.height
+                    elif hasattr(input_desc.type, 'multiArrayType'):
+                        array_type = input_desc.type.multiArrayType
+                        print(f"📊 Array input shape: {list(array_type.shape)}")
+                        # Store expected input size for later use
+                        if len(array_type.shape) >= 2:
+                            self._coreml_input_height = array_type.shape[-2]
+                            self._coreml_input_width = array_type.shape[-1]
+            
+        except Exception as e:
+            print(f"❌ Failed to load Core ML model: {e}")
+            raise
+    
     def estimate_depth(self, frame: np.ndarray) -> np.ndarray:
         """
         Estimate depth map from RGB frame.
@@ -174,6 +228,8 @@ class DepthEstimator:
             depth_map = self._estimate_depth_pytorch(frame)
         elif self.model_type == "huggingface":
             depth_map = self._estimate_depth_hf(frame)
+        elif self.model_type == "coreml":
+            depth_map = self._estimate_depth_coreml(frame)
         else:
             raise ValueError(f"Unknown model_type: {self.model_type}")
         
@@ -225,6 +281,67 @@ class DepthEstimator:
         depth_meters = depth_normalized * self.max_depth
         
         return depth_meters
+    
+    def _estimate_depth_coreml(self, frame: np.ndarray) -> np.ndarray:
+        """Estimate depth using Core ML model on Apple Neural Engine"""
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Store original dimensions
+        original_height, original_width = rgb_frame.shape[:2]
+        
+        # Resize to model's expected input size (518x392 for this Core ML model)
+        # Default to 518x392 if not detected from model spec
+        expected_height = getattr(self, '_coreml_input_height', 392)
+        expected_width = getattr(self, '_coreml_input_width', 518)
+        
+        rgb_resized = cv2.resize(rgb_frame, (expected_width, expected_height))
+        
+        # Convert to PIL Image (Core ML expects PIL Image input)
+        pil_image = Image.fromarray(rgb_resized)
+        
+        try:
+            # Run Core ML inference with PIL Image
+            input_dict = {"image": pil_image}
+            result = self.model.predict(input_dict)
+            
+            # Extract depth map
+            if "depth" in result:
+                depth_output = result["depth"]
+            elif "output" in result:
+                depth_output = result["output"]
+            else:
+                # Use first output
+                output_name = list(result.keys())[0]
+                depth_output = result[output_name]
+            
+            # Convert to numpy array
+            if hasattr(depth_output, 'numpy'):
+                depth_map = depth_output.numpy()
+            else:
+                depth_map = np.array(depth_output)
+            
+            # Remove batch dimension if present
+            while len(depth_map.shape) > 2:
+                depth_map = depth_map.squeeze(0)
+            
+            # Resize back to original frame size if needed
+            if depth_map.shape[:2] != (original_height, original_width):
+                depth_map = cv2.resize(depth_map, (original_width, original_height))
+            
+            # Ensure float32 format
+            depth_map = depth_map.astype(np.float32)
+            
+            # Scale to real-world depth range
+            # Core ML model outputs relative depth, scale to max_depth
+            depth_normalized = depth_map / depth_map.max() if depth_map.max() > 0 else depth_map
+            depth_meters = depth_normalized * self.max_depth
+            
+            return depth_meters
+            
+        except Exception as e:
+            print(f"❌ Core ML inference failed: {e}")
+            raise
     
     def get_3d_coordinates(self, point_2d: Tuple[int, int], 
                           depth_map: np.ndarray,
