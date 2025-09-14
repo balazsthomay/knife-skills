@@ -370,6 +370,118 @@ class OverlayRenderer:
             cv2.putText(frame, warning, (text_x, text_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     
+    def draw_hands(self, frame: np.ndarray, hands: List[HandLandmarks]):
+        """Draw hand landmarks and connections on frame"""
+        if not hands:
+            return
+        
+        rendered_frame = self.render_hands(frame, hands)
+        # Copy rendered overlays back to original frame
+        frame[:] = rendered_frame
+    
+    def draw_knives(self, frame: np.ndarray, knives: List[KnifeBoundary]):
+        """Draw knife detection overlays on frame"""
+        if not knives:
+            return
+        
+        rendered_frame = self.render_knives(frame, knives)
+        # Copy rendered overlays back to original frame
+        frame[:] = rendered_frame
+    
+    def draw_danger_warning(self, frame: np.ndarray, danger_event):
+        """Draw 2D danger warning for a single danger event"""
+        dangers = [danger_event] if danger_event else []
+        rendered_frame = self.render_safety_dangers(frame, dangers)
+        # Copy rendered overlays back to original frame
+        frame[:] = rendered_frame
+    
+    def draw_3d_danger_warning(self, frame: np.ndarray, danger_event_3d):
+        """Draw 3D danger warning with depth information"""
+        if not danger_event_3d:
+            return
+        
+        # Convert 3D hand landmarks back to 2D for visualization
+        hand = danger_event_3d.hand_3d.original_hand
+        fingertip_idx = danger_event_3d.fingertip_idx
+        severity = danger_event_3d.severity
+        distance_3d = danger_event_3d.distance_3d
+        distance_2d = danger_event_3d.distance_2d
+        
+        height, width = frame.shape[:2]
+        pixel_landmarks = self._normalize_to_pixel(hand.landmarks, width, height)
+        
+        if fingertip_idx < len(pixel_landmarks):
+            x, y = pixel_landmarks[fingertip_idx]
+            
+            # Get danger color
+            danger_color = self._get_danger_color(severity)
+            
+            # Draw enhanced 3D danger indicator
+            danger_radius = self.LANDMARK_RADIUS + 6  # Larger for 3D
+            cv2.circle(frame, (x, y), danger_radius, danger_color, -1)
+            
+            # Draw white border
+            cv2.circle(frame, (x, y), danger_radius + 2, (255, 255, 255), 2)
+            
+            # Draw depth-aware danger ring
+            depth_ring_radius = danger_radius + 8
+            cv2.circle(frame, (x, y), depth_ring_radius, (0, 255, 255), 2)  # Cyan for 3D
+            
+            # Add pulsing effect for critical 3D dangers
+            if severity == 'critical':
+                pulse_radius = danger_radius + 12
+                cv2.circle(frame, (x, y), pulse_radius, danger_color, 3)
+            
+            # Draw 3D distance information
+            distance_text = f"3D: {distance_3d*1000:.1f}mm"
+            text_pos = (x + 15, y - 10)
+            
+            # Text background
+            text_size = cv2.getTextSize(distance_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(frame, 
+                         (text_pos[0] - 2, text_pos[1] - text_size[1] - 2),
+                         (text_pos[0] + text_size[0] + 2, text_pos[1] + 2),
+                         (0, 0, 0), -1)
+            
+            # Distance text
+            cv2.putText(frame, distance_text, text_pos,
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
+            # Comparison text (2D vs 3D)
+            if distance_2d > 0:
+                comparison_text = f"2D: {distance_2d:.0f}px"
+                comp_pos = (x + 15, y + 15)
+                cv2.putText(frame, comparison_text, comp_pos,
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        
+        # Draw 3D warning message
+        warning_text = f"3D {severity.upper()}: {distance_3d*1000:.1f}mm to blade!"
+        self._draw_3d_warning_message(frame, warning_text, severity)
+    
+    def _draw_3d_warning_message(self, frame: np.ndarray, warning_text: str, severity: str):
+        """Draw 3D-specific warning message"""
+        # Position at top-center
+        text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = (frame.shape[1] - text_size[0]) // 2
+        text_y = 120  # Below other warnings
+        
+        # Background rectangle with 3D indicator color
+        cv2.rectangle(frame, 
+                     (text_x - 10, text_y - text_size[1] - 5),
+                     (text_x + text_size[0] + 10, text_y + 5),
+                     (40, 40, 40), -1)  # Dark background
+        
+        # Border with danger color
+        danger_color = self._get_danger_color(severity)
+        cv2.rectangle(frame, 
+                     (text_x - 10, text_y - text_size[1] - 5),
+                     (text_x + text_size[0] + 10, text_y + 5),
+                     danger_color, 2)
+        
+        # 3D warning text with cyan accent
+        cv2.putText(frame, warning_text, (text_x, text_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    
     def set_display_options(self, show_connections: bool = None, 
                            show_landmarks: bool = None, show_labels: bool = None):
         """Update display options"""
