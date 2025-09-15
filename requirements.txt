@@ -1,0 +1,9 @@
+opencv-python
+numpy
+Pillow
+torch
+ultralytics
+mediapipe
+transformers
+coremltools
+scikit-learn
