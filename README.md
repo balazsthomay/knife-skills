@@ -25,6 +25,10 @@ Computer vision system that monitors knife safety in real-time using:
 - 3D distance calculations
 - Filters false positives from 2D overlap
 
+## Demo
+
+See the system in action: `video_demo`
+
 ## Quick Start
 
 ```bash
