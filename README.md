@@ -27,7 +27,9 @@ Computer vision system that monitors knife safety in real-time using:
 
 ## Demo
 
-See the system in action: `video_demo`
+![Knife Safety Monitor Demo](demo.gif)
+
+*Real-time knife safety monitoring with hand tracking, blade detection, and 3D depth-aware safety alerts*
 
 ## Quick Start
 
